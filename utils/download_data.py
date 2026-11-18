@@ -57,94 +57,206 @@ def connect_mt5():
 
 def download(symbol, timeframe_name, timeframe):
     """
-    Download historical OHLC data using MT5's position-based method.
+    Download historical OHLC data from MetaTrader 5 in chunks.
 
-    This requests a large number of the most recent candles rather
-    than passing a date range to MT5. This is more compatible with
-    different MT5 broker terminals.
+    MT5's terminal/broker is currently rejecting large requests,
+    so we request 1,000 candles at a time and work backwards.
+
+    The chunks are then combined into one dataset.
+
+    Parameters
+    ----------
+    symbol : str
+        MT5 symbol, e.g. XAUUSD.
+
+    timeframe_name : str
+        Human-readable timeframe, e.g. M15.
+
+    timeframe :
+        MT5 timeframe constant.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Combined historical dataset.
     """
 
     print(f"\nDownloading {symbol} {timeframe_name}...")
 
-    # Make sure the symbol is available in Market Watch
+    # --------------------------------------------------------
+    # Make sure the symbol is available
+    # --------------------------------------------------------
+
     if not mt5.symbol_select(symbol, True):
-        print(f"Failed to select symbol: {symbol}")
+
+        print(f"Failed to select {symbol}")
         print("MT5 Error:", mt5.last_error())
+
         return None
 
     # --------------------------------------------------------
-    # Number of candles to request
-    # --------------------------------------------------------
-    #
-    # M15:
-    # 100,000 candles ≈ 1,041 days
-    #
-    # H1:
-    # 100,000 candles ≈ 11 years
-    #
-    # H4:
-    # 100,000 candles ≈ 45 years
-    #
-    # We will later build a proper chunked downloader if we
-    # need more M15 history.
+    # Maximum number of candles requested per MT5 call
     # --------------------------------------------------------
 
-    bars_to_download = 1000
+    CHUNK_SIZE = 1000
 
-    rates = mt5.copy_rates_from_pos(
-        symbol,
-        timeframe,
-        0,
-        bars_to_download
-    )
+    # --------------------------------------------------------
+    # Number of chunks we want.
+    #
+    # 100 chunks × 1,000 candles = up to 100,000 candles.
+    #
+    # We will later make this configurable.
+    # --------------------------------------------------------
 
-    print("MT5 Error:", mt5.last_error())
+    MAX_CHUNKS = 100
 
-    if rates is None:
+    all_data = []
+
+    # MT5 position 0 represents the most recent candle.
+    #
+    # We start from the latest candle and move backwards.
+    start_pos = 0
+
+    # --------------------------------------------------------
+    # Download chunks
+    # --------------------------------------------------------
+
+    for chunk_number in range(MAX_CHUNKS):
 
         print(
-            f"No data received for {symbol} {timeframe_name}"
+            f"Downloading chunk "
+            f"{chunk_number + 1}/{MAX_CHUNKS}..."
+        )
+
+        rates = mt5.copy_rates_from_pos(
+            symbol,
+            timeframe,
+            start_pos,
+            CHUNK_SIZE
+        )
+
+        # ----------------------------------------------------
+        # Check for errors
+        # ----------------------------------------------------
+
+        if rates is None:
+
+            print(
+                f"MT5 returned no data at position "
+                f"{start_pos}"
+            )
+
+            print(
+                "MT5 Error:",
+                mt5.last_error()
+            )
+
+            break
+
+        # ----------------------------------------------------
+        # Stop if MT5 returns no candles
+        # ----------------------------------------------------
+
+        if len(rates) == 0:
+
+            print("No more historical data available.")
+
+            break
+
+        # ----------------------------------------------------
+        # Convert to DataFrame
+        # ----------------------------------------------------
+
+        chunk = pd.DataFrame(rates)
+
+        # Convert Unix timestamp
+        chunk["time"] = pd.to_datetime(
+            chunk["time"],
+            unit="s"
+        )
+
+        # Add chunk
+        all_data.append(chunk)
+
+        print(
+            f"Received {len(chunk)} candles | "
+            f"{chunk['time'].min()} → "
+            f"{chunk['time'].max()}"
+        )
+
+        # ----------------------------------------------------
+        # If fewer than CHUNK_SIZE were returned, we have
+        # reached the available historical data.
+        # ----------------------------------------------------
+
+        if len(chunk) < CHUNK_SIZE:
+
+            print(
+                "Reached available historical data."
+            )
+
+            break
+
+        # ----------------------------------------------------
+        # Move backwards by another chunk.
+        # ----------------------------------------------------
+
+        start_pos += CHUNK_SIZE
+
+    # --------------------------------------------------------
+    # Make sure something was downloaded
+    # --------------------------------------------------------
+
+    if not all_data:
+
+        print(
+            f"No historical data downloaded for "
+            f"{symbol} {timeframe_name}"
         )
 
         return None
 
-    if len(rates) == 0:
+    # --------------------------------------------------------
+    # Combine all chunks
+    # --------------------------------------------------------
 
-        print(
-            f"MT5 returned zero candles for {symbol} {timeframe_name}"
-        )
-
-        return None
-
-    # Convert to DataFrame
-    df = pd.DataFrame(rates)
-
-    # Convert Unix timestamp to datetime
-    df["time"] = pd.to_datetime(
-        df["time"],
-        unit="s"
+    df = pd.concat(
+        all_data,
+        ignore_index=True
     )
 
+    # --------------------------------------------------------
     # Sort oldest → newest
+    # --------------------------------------------------------
+
     df.sort_values(
         "time",
         inplace=True
     )
 
+    # --------------------------------------------------------
     # Remove duplicate timestamps
+    # --------------------------------------------------------
+
     df.drop_duplicates(
         subset="time",
         keep="first",
         inplace=True
     )
 
+    # --------------------------------------------------------
     # Reset index
+    # --------------------------------------------------------
+
     df.reset_index(
         drop=True,
         inplace=True
     )
 
-    # Create directory
+    # --------------------------------------------------------
+    # Save raw data
+    # --------------------------------------------------------
+
     output_directory = "data/raw"
 
     os.makedirs(
@@ -152,25 +264,28 @@ def download(symbol, timeframe_name, timeframe):
         exist_ok=True
     )
 
-    # Create filename
     filename = os.path.join(
         output_directory,
         f"{symbol}_{timeframe_name}.csv"
     )
 
-    # Save
     df.to_csv(
         filename,
         index=False
     )
 
-    # Report
+    # --------------------------------------------------------
+    # Report final dataset
+    # --------------------------------------------------------
+
+    print("\n------------------------------------------")
+
     print(
         f"Saved: {filename}"
     )
 
     print(
-        f"Candles downloaded: {len(df):,}"
+        f"Total candles: {len(df):,}"
     )
 
     print(
@@ -181,12 +296,9 @@ def download(symbol, timeframe_name, timeframe):
         f"Last candle: {df['time'].iloc[-1]}"
     )
 
-    print(
-        f"Columns: {list(df.columns)}"
-    )
+    print("------------------------------------------")
 
     return df
-
 # ============================================================
 # MAIN PROGRAM
 # ============================================================
